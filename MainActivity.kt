@@ -45,6 +45,23 @@ class MainActivity : Activity() {
         return values[sp.selectedItemPosition]
     }
 
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != 42) return
+        if (resultCode == RESULT_OK && data != null) {
+            startForegroundService(
+                Intent(this, CapriService::class.java)
+                    .setAction("screen_start")
+                    .putExtra("code", resultCode)
+                    .putExtra("data", data)
+            )
+            Toast.makeText(this, "Capri sekarang bisa lihat layar.", Toast.LENGTH_SHORT).show()
+        } else {
+            Toast.makeText(this, "Izin lihat layar dibatalkan.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         askPermissions()
@@ -109,8 +126,8 @@ class MainActivity : Activity() {
         // ---------- SUARA ----------
         col.addView(header("SUARA"))
         val voiceMode = pick(
-            arrayOf("Mati (teks saja)", "Suara HP", "ElevenLabs"),
-            arrayOf("off", "phone", "cloud"),
+            arrayOf("Mati (teks saja)", "Suara HP", "ElevenLabs", "Fish Audio"),
+            arrayOf("off", "phone", "cloud", "fish"),
             prefs.getString("voice_mode", "cloud") ?: "cloud"
         )
         val eKey = EditText(this).apply {
@@ -122,6 +139,17 @@ class MainActivity : Activity() {
         val eVoice = EditText(this).apply {
             hint = "Voice ID ElevenLabs"
             setText(prefs.getString("eleven_voice", ""))
+            setSingleLine()
+        }
+        val fKey = EditText(this).apply {
+            hint = "Fish Audio API key"
+            setText(prefs.getString("fish_key", ""))
+            setSingleLine()
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+        val fVoice = EditText(this).apply {
+            hint = "Voice ID Fish Audio"
+            setText(prefs.getString("fish_voice", ""))
             setSingleLine()
         }
         val eModel = pick(
@@ -140,6 +168,10 @@ class MainActivity : Activity() {
         )
         col.addView(label("Suara"))
         col.addView(voiceMode)
+        col.addView(label("Fish Audio API key (kalau pilih Fish Audio)"))
+        col.addView(fKey)
+        col.addView(label("Voice ID Fish Audio"))
+        col.addView(fVoice)
         col.addView(label("ElevenLabs API key"))
         col.addView(eKey)
         col.addView(label("Voice ID"))
@@ -174,6 +206,31 @@ class MainActivity : Activity() {
         col.addView(label("Ukuran Capri (berlaku setelah Mulai ulang)"))
         col.addView(size)
 
+        val robotF = numberField(prefs.getString("robot", "0") ?: "0", "0-100")
+        val glitchF = numberField(prefs.getString("glitch", "0") ?: "0", "0-100")
+        val holo = pick(arrayOf("Mati", "Nyala"), arrayOf("off", "on"), prefs.getString("hologram", "off") ?: "off")
+        val headPats = pick(arrayOf("Mati", "Nyala"), arrayOf("off", "on"), prefs.getString("headpats", "on") ?: "on")
+        val sleepSp = pick(arrayOf("Mati", "Setelah 5 menit", "Setelah 15 menit"), arrayOf("0", "5", "15"), prefs.getString("sleep", "0") ?: "0")
+        val wander = pick(arrayOf("Mati", "Nyala"), arrayOf("off", "on"), prefs.getString("wander", "off") ?: "off")
+        val views = arrayOf<android.view.View>(robotF, glitchF, holo, headPats, sleepSp, wander)
+
+        val popins = pick(arrayOf("Mati", "Jarang (45 menit)", "Sering (15 menit)"), arrayOf("off", "rare", "often"), prefs.getString("popins", "off") ?: "off")
+        val checkin = pick(arrayOf("Mati", "Nyala"), arrayOf("off", "on"), prefs.getString("checkin", "off") ?: "off")
+        val chaos = pick(arrayOf("Mati", "Nyala"), arrayOf("off", "on"), prefs.getString("chaos", "off") ?: "off")
+        val typing = pick(arrayOf("Mati", "Nyala"), arrayOf("off", "on"), prefs.getString("typingsound", "off") ?: "off")
+        val sounds = numberField(prefs.getString("sounds", "100") ?: "100", "0-100")
+        val wake = pick(arrayOf("Mati", "Nyala (boros baterai)"), arrayOf("off", "on"), prefs.getString("wake", "off") ?: "off")
+
+        val watch = pick(arrayOf("Mati", "Nyala"), arrayOf("off", "on"), prefs.getString("watch", "off") ?: "off")
+        val watchEvery = pick(arrayOf("5 detik", "10 detik", "30 detik"), arrayOf("5", "10", "30"), prefs.getString("watch_every", "10") ?: "10")
+
+        val bubble = pick(arrayOf("Cepat (6 detik)", "Normal (12 detik)", "Lama (25 detik)"), arrayOf("quick", "normal", "long"), prefs.getString("bubble", "normal") ?: "normal")
+        val followup = pick(arrayOf("Mati", "Nyala"), arrayOf("off", "on"), prefs.getString("followup", "off") ?: "off")
+        val remember = pick(arrayOf("Mati", "Nyala"), arrayOf("off", "on"), prefs.getString("remember", "off") ?: "off")
+        val watchMem = pick(arrayOf("20 catatan", "50 catatan", "96 catatan"), arrayOf("20", "50", "96"), prefs.getString("watchmem", "20") ?: "20")
+        val mini = pick(arrayOf("Mati", "Nyala"), arrayOf("off", "on"), prefs.getString("mini", "off") ?: "off")
+        val perch = pick(arrayOf("Mati", "Nyala"), arrayOf("off", "on"), prefs.getString("perch", "off") ?: "off")
+
         fun save() {
             prefs.edit()
                 .putString("key", key.text.toString().trim())
@@ -183,6 +240,8 @@ class MainActivity : Activity() {
                 .putString("replies", picked(replies))
                 .putString("memory", picked(memory))
                 .putString("voice_mode", picked(voiceMode))
+                .putString("fish_key", fKey.text.toString().trim())
+                .putString("fish_voice", fVoice.text.toString().trim())
                 .putString("eleven_key", eKey.text.toString().trim())
                 .putString("eleven_voice", eVoice.text.toString().trim())
                 .putString("eleven_model", picked(eModel))
@@ -192,8 +251,107 @@ class MainActivity : Activity() {
                 .putString("volume", volume.text.toString().trim())
                 .putString("pitch", picked(pitch))
                 .putString("size", picked(size))
+                .putString("robot", robotF.text.toString().trim())
+                .putString("glitch", glitchF.text.toString().trim())
+                .putString("hologram", picked(holo))
+                .putString("headpats", picked(headPats))
+                .putString("sleep", picked(sleepSp))
+                .putString("wander", picked(wander))
+                .putString("popins", picked(popins))
+                .putString("checkin", picked(checkin))
+                .putString("chaos", picked(chaos))
+                .putString("typingsound", picked(typing))
+                .putString("sounds", sounds.text.toString().trim())
+                .putString("wake", picked(wake))
+                .putString("watch", picked(watch))
+                .putString("watch_every", picked(watchEvery))
+                .putString("bubble", picked(bubble))
+                .putString("followup", picked(followup))
+                .putString("remember", picked(remember))
+                .putString("watchmem", picked(watchMem))
+                .putString("mini", picked(mini))
+                .putString("perch", picked(perch))
                 .apply()
         }
+
+        // ---------- EFEK & TINGKAH ----------
+        col.addView(header("EFEK & TINGKAH"))
+        col.addView(label("Robot (0-100, efek suara robot)"))
+        col.addView(robotF)
+        col.addView(label("Glitch (0-100, suara sesekali putus)"))
+        col.addView(glitchF)
+        col.addView(label("Hologram (tampilan biru transparan)"))
+        col.addView(holo)
+        col.addView(label("Elus kepala (ketuk bagian atas Capri)"))
+        col.addView(headPats)
+        col.addView(label("Tidur kalau nggak diajak ngobrol"))
+        col.addView(sleepSp)
+        col.addView(label("Jalan-jalan sendiri di layar"))
+        col.addView(wander)
+
+        col.addView(header("OBROLAN & SUARA TAMBAHAN"))
+        col.addView(label("Capri ngomong duluan (sesekali)"))
+        col.addView(popins)
+        col.addView(label("Check in kalau kamu lama nggak ngobrol (2 jam)"))
+        col.addView(checkin)
+        col.addView(label("Chaos (kadang glitch sendiri)"))
+        col.addView(chaos)
+        col.addView(label("Bunyi saat mengetik"))
+        col.addView(typing)
+        col.addView(label("Volume bunyi efek (0-100)"))
+        col.addView(sounds)
+        col.addView(label("Panggil Capri pakai suara (mic nyala terus, boros baterai)"))
+        col.addView(wake)
+
+        col.addView(header("LIHAT LAYAR"))
+        col.addView(label("Capri lihat layar kamu saat kamu kirim pesan (gambar cuma disimpan sementara di HP)"))
+        col.addView(watch)
+        col.addView(label("Perbarui gambar tiap"))
+        col.addView(watchEvery)
+        val startScreen = Button(this).apply {
+            text = "Mulai lihat layar (Android minta izin)"
+            setOnClickListener {
+                save()
+                val mpm = getSystemService(android.media.projection.MediaProjectionManager::class.java)
+                startActivityForResult(mpm.createScreenCaptureIntent(), 42)
+            }
+        }
+        val stopScreen = Button(this).apply {
+            text = "Stop lihat layar"
+            setOnClickListener { startService(Intent(this@MainActivity, CapriService::class.java).setAction("screen_stop")) }
+        }
+        col.addView(startScreen)
+        col.addView(stopScreen)
+
+        col.addView(header("TAMPILAN & INGATAN"))
+        col.addView(label("Gelembung bicara (berapa lama muncul)"))
+        col.addView(bubble)
+        col.addView(label("Lanjut ngomong sendiri setelah jawaban (30 detik)"))
+        col.addView(followup)
+        col.addView(label("Ingat apa yang dilihat dari layar (tiap menit, perlu Lihat layar nyala)"))
+        col.addView(remember)
+        col.addView(label("Jumlah catatan layar yang diingat"))
+        col.addView(watchMem)
+        col.addView(label("Mode mini (tombol chat cuma kirim dan tutup)"))
+        col.addView(mini)
+        col.addView(label("Duduk di tepi bawah layar (bukan jalan-jalan)"))
+        col.addView(perch)
+        col.addView(header("BANTUAN"))
+        val help = Button(this).apply {
+            text = "Bantuan (buka panduan)"
+            setOnClickListener { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/lachydotmcg/capri-desktop#readme"))) }
+        }
+        val updates = Button(this).apply {
+            text = "Cek update"
+            setOnClickListener { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/lachydotmcg/capri-desktop/releases"))) }
+        }
+        val support = Button(this).apply {
+            text = "Dukung proyek Capri"
+            setOnClickListener { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/lachydotmcg/capri-desktop"))) }
+        }
+        col.addView(help)
+        col.addView(updates)
+        col.addView(support)
 
         // ---------- TOMBOL ----------
         val overlay = Button(this).apply {

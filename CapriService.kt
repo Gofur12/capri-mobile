@@ -2,6 +2,11 @@ package app.capri.mobile
 
 import android.Manifest
 import android.app.Notification
+import android.app.PendingIntent
+import android.graphics.drawable.Icon
+import android.media.AudioManager
+import android.media.ToneGenerator
+import android.text.TextWatcher
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
@@ -23,7 +28,9 @@ import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import android.animation.ValueAnimator
 import android.view.Gravity
+import android.view.View
 import android.view.MotionEvent
 import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
@@ -57,6 +64,10 @@ class CapriService : Service() {
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun prefs(): SharedPreferences = getSharedPreferences("capri", Context.MODE_PRIVATE)
+    private fun robotLevel() = prefs().getString("robot", "0")?.toIntOrNull() ?: 0
+    private fun glitchLevel() = prefs().getString("glitch", "0")?.toIntOrNull() ?: 0
+    private fun wanderOn() = prefs().getString("wander", "off") == "on"
+    private fun headPatsOn() = prefs().getString("headpats", "on") == "on"
     private fun voiceOn() = prefs().getBoolean("voice", true) && prefs().getString("voice_mode", "cloud") != "off"
     private fun volumeLevel(): Float = ((prefs().getString("volume", "100")?.toIntOrNull() ?: 100) / 100f).coerceIn(0f, 1f)
     private fun speedValue(): Float = (prefs().getString("eleven_speed", "")?.toFloatOrNull() ?: 1.0f).coerceIn(0.7f, 1.2f)
@@ -94,24 +105,56 @@ class CapriService : Service() {
     }
 
     override fun onStartCommand(i: Intent?, flags: Int, startId: Int): Int {
+        if (i?.action == "screen_start") ScreenWatch.wanted = true
         startAsForeground()
         if (pet == null) showPet()
+        when (i?.action) {
+            "hide" -> toggleHide()
+            "bring" -> bringHere()
+            "screen_start" -> {
+                val code = i?.getIntExtra("code", 0) ?: 0
+                @Suppress("DEPRECATION")
+                val data: Intent? = if (Build.VERSION.SDK_INT >= 33)
+                    i?.getParcelableExtra("data", Intent::class.java)
+                else i?.getParcelableExtra("data")
+                if (data != null) {
+                    val every = (prefs().getString("watch_every", "10")?.toLongOrNull() ?: 10L) * 1000L
+                    ScreenWatch.start(this, code, data, every)
+                }
+            }
+            "screen_stop" -> {
+                ScreenWatch.wanted = false
+                ScreenWatch.stop()
+                startAsForeground()
+            }
+        }
         return START_STICKY
     }
 
     private fun startAsForeground() {
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(NotificationChannel("capri", "Capri", NotificationManager.IMPORTANCE_LOW))
+        fun action(act: String, label: String): Notification.Action {
+            val pi = PendingIntent.getService(
+                this, act.hashCode(),
+                Intent(this, CapriService::class.java).setAction(act),
+                PendingIntent.FLAG_IMMUTABLE
+            )
+            return Notification.Action.Builder(Icon.createWithResource(this, android.R.drawable.ic_menu_view), label, pi).build()
+        }
         val n = Notification.Builder(this, "capri")
             .setContentTitle("Capri aktif")
             .setContentText("Ketuk Capri di layar buat ngobrol")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .addAction(action("hide", if (hidden) "Tampilkan" else "Sembunyikan"))
+            .addAction(action("bring", "Bawa ke sini"))
             .build()
         val mic = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         try {
             if (Build.VERSION.SDK_INT >= 34) {
                 var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
                 if (mic) type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                if (ScreenWatch.wanted) type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
                 startForeground(1, n, type)
             } else if (Build.VERSION.SDK_INT >= 30 && mic) {
                 startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
@@ -123,9 +166,224 @@ class CapriService : Service() {
         }
     }
 
+    private var petLp: WindowManager.LayoutParams? = null
+    private var lastTalk = System.currentTimeMillis()
+    private var lastProactive = 0L
+    private var lastCheckin = 0L
+    private var hidden = false
+
+    private val proactiveRun = object : Runnable {
+        override fun run() {
+            val now = System.currentTimeMillis()
+            val p = prefs()
+            if (panel == null && pet != null) {
+                val gap = when (p.getString("popins", "off")) { "rare" -> 45L; "often" -> 15L; else -> 0L }
+                if (gap > 0 && now - lastProactive > gap * 60_000L) {
+                    lastProactive = now
+                    proactive(POP_INSTR)
+                }
+                if (p.getString("checkin", "off") == "on" && now - lastTalk > 2 * 3_600_000L && now - lastCheckin > 2 * 3_600_000L) {
+                    lastCheckin = now
+                    lastTalk = now
+                    proactive(CHECK_INSTR)
+                }
+                val r = kotlin.random.Random.nextFloat()
+                if (p.getString("chaos", "off") == "on" && r < 0.05f) pet?.play(if (r < 0.025f) "glitch" else "dance", loop = false)
+                rememberScreen(now)
+            }
+            ui.postDelayed(this, 60_000L)
+        }
+    }
+    private var dragActive = false
+    private var longFired = false
+
+    private val longPressRun = Runnable {
+        longFired = true
+        bringHere()
+    }
+    private val screenLines = ArrayList<String>()
+    private var lastRemember = 0L
+    private var bubble: TextView? = null
+    private val bubbleHide = Runnable { removeBubble() }
+    private val followRun = Runnable { proactive(FOLLOW_INSTR) }
+
+    private fun removeBubble() {
+        bubble?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+        bubble = null
+    }
+
+    private fun showBubble(msg: String) {
+        val base = petLp ?: return
+        if (pet == null) return
+        removeBubble()
+        val tv = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            textSize = 13f
+            setPadding(dp(8), dp(6), dp(8), dp(6))
+            maxWidth = dp(230)
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#F2101820"))
+                setStroke(dp(2), Color.parseColor("#05D9E8"))
+                cornerRadius = dp(8).toFloat()
+            }
+            text = msg
+        }
+        val lp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+            PixelFormat.TRANSLUCENT
+        )
+        lp.gravity = Gravity.TOP or Gravity.START
+        lp.x = base.x.coerceIn(0, (resources.displayMetrics.widthPixels - dp(240)).coerceAtLeast(0))
+        lp.y = (base.y - dp(90)).coerceAtLeast(dp(20))
+        try {
+            wm.addView(tv, lp)
+            bubble = tv
+        } catch (_: Exception) {
+            return
+        }
+        val ms = when (prefs().getString("bubble", "normal")) {
+            "quick" -> 6000L
+            "long" -> 25000L
+            else -> 12000L
+        }
+        ui.removeCallbacks(bubbleHide)
+        ui.postDelayed(bubbleHide, ms)
+    }
+
+    // Tiap menit, kalau layar dibagikan: Capri catat apa yang sedang dilihat, untuk ingatan obrolan.
+    private fun rememberScreen(now: Long) {
+        val p = prefs()
+        if (p.getString("remember", "off") != "on" || p.getString("watch", "off") != "on") return
+        if (now - lastRemember < 60_000L) return
+        val img = ScreenWatch.freshB64(90_000L) ?: return
+        lastRemember = now
+        val key = (p.getString("key", "") ?: "").trim()
+        if (key.isEmpty()) return
+        val model = (p.getString("model", "") ?: "").trim().ifEmpty { Brain.DEFAULT_MODEL }
+        val memory = p.getString("memory", "20")?.toIntOrNull() ?: 20
+        val max = p.getString("watchmem", "20")?.toIntOrNull() ?: 20
+        thread {
+            val line = Brain.ask(key, model, REMEMBER_INSTR, "", "en", "short", memory, true, img, "")
+            if (line.isBlank() || Brain.isError(line)) return@thread
+            synchronized(screenLines) {
+                screenLines.add(line.take(160))
+                while (screenLines.size > max) screenLines.removeAt(0)
+            }
+        }
+    }
+
+    private var sleeping = false
+    private val sleepRun = Runnable {
+        sleeping = true
+        pet?.play("laydown_sleep")
+    }
+    private val wanderRun = object : Runnable {
+        override fun run() {
+            if (wanderOn() && pet != null && panel == null && !dragActive && !sleeping) wanderTo(randomSpot())
+            ui.postDelayed(this, 25000L)
+        }
+    }
+
+    private fun proactive(instruction: String) {
+        val p = prefs()
+        val key = (p.getString("key", "") ?: "").trim()
+        if (key.isEmpty()) return
+        val model = (p.getString("model", "") ?: "").trim().ifEmpty { Brain.DEFAULT_MODEL }
+        val nick = (p.getString("nick", "") ?: "").trim()
+        val lang = p.getString("lang", "id") ?: "id"
+        val replies = p.getString("replies", "short") ?: "short"
+        val memory = p.getString("memory", "20")?.toIntOrNull() ?: 20
+        thread {
+            val out = Brain.ask(key, model, instruction, nick, lang, replies, memory, true)
+            if (out.isBlank() || Brain.isError(out)) return@thread
+            ui.post {
+                lastReply = out
+                if (panel != null) say(out)
+                pet?.play("grin", loop = false)
+                speak(out)
+            }
+        }
+    }
+
+    private fun playTone() {
+        val vol = (prefs().getString("sounds", "100")?.toIntOrNull() ?: 100).coerceIn(0, 100)
+        if (vol == 0) return
+        try {
+            val g = ToneGenerator(AudioManager.STREAM_NOTIFICATION, vol)
+            g.startTone(ToneGenerator.TONE_PROP_BEEP, 40)
+            ui.postDelayed({ g.release() }, 200L)
+        } catch (_: Exception) {}
+    }
+
+    private fun toggleHide() {
+        hidden = !hidden
+        pet?.visibility = if (hidden) View.GONE else View.VISIBLE
+        startAsForeground()
+    }
+
+    private fun wakeOn() = prefs().getString("wake", "off") == "on"
+
+    // Mode "Panggil Capri": mic terus mendengarkan dan membuka chat kalau nama Capri disebut.
+    private fun wakeLoop(ms: Long) {
+        ui.postDelayed({ if (wakeOn() && panel == null && !listening && !callMode) startListening() }, ms)
+    }
+
+    private fun wake() {
+        if (sleeping) { sleeping = false; pet?.play("wake", loop = false) }
+        ui.removeCallbacks(sleepRun)
+        val mins = prefs().getString("sleep", "0")?.toIntOrNull() ?: 0
+        if (mins > 0) ui.postDelayed(sleepRun, mins * 60_000L)
+    }
+
+    private fun randomSpot(): Pair<Int, Int> {
+        val lp = petLp ?: return Pair(0, 0)
+        val maxX = (resources.displayMetrics.widthPixels - lp.width).coerceAtLeast(0)
+        val minY = dp(60)
+        val maxY = (resources.displayMetrics.heightPixels - lp.height - dp(120)).coerceAtLeast(minY + 1)
+        return Pair(
+            kotlin.random.Random.nextInt(maxX + 1),
+            minY + kotlin.random.Random.nextInt(maxY - minY)
+        )
+    }
+
+    private fun wanderTo(target: Pair<Int, Int>) {
+        val lp = petLp ?: return
+        val v = pet ?: return
+        val fromX = lp.x
+        val fromY = lp.y
+        v.setFlip(target.first < fromX)
+        v.play("walk")
+        ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 1400L
+            addListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(a: Animator) { pet?.play("idle") }
+            })
+            addUpdateListener { a ->
+                val f = a.animatedFraction
+                lp.x = (fromX + (target.first - fromX) * f).toInt()
+                lp.y = (fromY + (target.second - fromY) * f).toInt()
+                try { wm.updateViewLayout(v, lp) } catch (_: Exception) {}
+            }
+            start()
+        }
+    }
+
+    // Tahan lama Capri = pindah ke tengah bawah layar.
+    private fun bringHere() {
+        val lp = petLp ?: return
+        val v = pet ?: return
+        lp.x = (resources.displayMetrics.widthPixels - lp.width) / 2
+        lp.y = resources.displayMetrics.heightPixels - lp.height - dp(120)
+        try { wm.updateViewLayout(v, lp) } catch (_: Exception) {}
+        wake()
+    }
+
     private fun showPet() {
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         val v = SpriteView(this)
+        v.setHologram(prefs().getString("hologram", "off") == "on")
         val lp = WindowManager.LayoutParams(
             dp(petWidthDp()), dp(petWidthDp() * 8 / 5),
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
@@ -135,6 +393,7 @@ class CapriService : Service() {
         lp.gravity = Gravity.TOP or Gravity.START
         lp.x = dp(16)
         lp.y = dp(240)
+        petLp = lp
 
         var downX = 0f
         var downY = 0f
@@ -147,24 +406,56 @@ class CapriService : Service() {
                     downX = e.rawX; downY = e.rawY
                     startX = lp.x; startY = lp.y
                     dragging = false
+                    longFired = false
+                    wake()
+                    ui.postDelayed(longPressRun, 600L)
                 }
                 MotionEvent.ACTION_MOVE -> {
                     val dx = e.rawX - downX
                     val dy = e.rawY - downY
-                    if (!dragging && (abs(dx) > dp(8) || abs(dy) > dp(8))) { dragging = true; v.play("dangle") }
+                    if (!dragging && (abs(dx) > dp(8) || abs(dy) > dp(8))) {
+                        dragging = true
+                        dragActive = true
+                        ui.removeCallbacks(longPressRun)
+                        v.play("dangle")
+                    }
                     if (dragging) {
                         lp.x = startX + dx.toInt()
                         lp.y = startY + dy.toInt()
                         wm.updateViewLayout(v, lp)
                     }
                 }
-                MotionEvent.ACTION_UP -> if (dragging) v.play("idle") else togglePanel()
+                MotionEvent.ACTION_UP -> {
+                    ui.removeCallbacks(longPressRun)
+                    if (dragging) {
+                        dragActive = false
+                        v.play("idle")
+                    } else if (!longFired) {
+                        if (headPatsOn() && e.y < v.height * 0.35f) {
+                            v.play("grin", loop = false) // elus kepala
+                        } else {
+                            togglePanel()
+                        }
+                    }
+                    longFired = false
+                    wake()
+                }
             }
             true
         }
         try {
             wm.addView(v, lp)
             pet = v
+            if (prefs().getString("perch", "off") == "on") {
+                bringHere()
+                v.play("perch")
+            } else {
+                v.play("arrive", loop = false)
+            }
+            wake()
+            ui.postDelayed(wanderRun, 25000L)
+            ui.postDelayed(proactiveRun, 60000L)
+            if (wakeOn()) wakeLoop(1000)
         } catch (e: Exception) {
             stopSelf() // izin overlay belum diberikan
         }
@@ -203,11 +494,23 @@ class CapriService : Service() {
             setSingleLine()
             imeOptions = EditorInfo.IME_ACTION_SEND
         }
+        inp.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                if (prefs().getString("typingsound", "off") == "on") playTone()
+            }
+            override fun afterTextChanged(s: android.text.Editable?) {}
+        })
         val send = smallButton("Kirim")
         val mic = smallButton("🎤")
         val call = smallButton("📞")
         val voice = smallButton("🔊")
         val close = smallButton("Tutup")
+        if (prefs().getString("mini", "off") == "on") {
+            mic.visibility = View.GONE
+            call.visibility = View.GONE
+            voice.visibility = View.GONE
+        }
         val row = LinearLayout(this)
         for (b in listOf(send, mic, call, voice, close)) {
             row.addView(b, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
@@ -263,6 +566,7 @@ class CapriService : Service() {
         micBtn = null
         callBtn = null
         voiceBtn = null
+        if (wakeOn()) wakeLoop(800)
     }
 
     private fun refresh() {
@@ -293,6 +597,9 @@ class CapriService : Service() {
             return
         }
         say("…")
+        ui.removeCallbacks(followRun)
+        lastTalk = System.currentTimeMillis()
+        wake()
         stopAudio()
         pet?.stopTalk()
         pet?.play("glitch")
@@ -300,10 +607,17 @@ class CapriService : Service() {
             val lang = p.getString("lang", "id") ?: "id"
             val replies = p.getString("replies", "short") ?: "short"
             val memory = p.getString("memory", "20")?.toIntOrNull() ?: 20
-            val out = Brain.ask(key, model, text, nick, lang, replies, memory)
+            val img = if (prefs().getString("watch", "off") == "on") ScreenWatch.freshB64(90_000L) else null
+            val ctx = synchronized(screenLines) { screenLines.joinToString("; ") }
+            val out = Brain.ask(key, model, text, nick, lang, replies, memory, false, img, ctx)
             ui.post {
                 lastReply = out
                 say(out)
+                showBubble(out)
+                if (prefs().getString("followup", "off") == "on") {
+                    ui.removeCallbacks(followRun)
+                    ui.postDelayed(followRun, 30_000L)
+                }
                 pet?.play("idle")
                 speak(out)
             }
@@ -316,7 +630,25 @@ class CapriService : Service() {
         val p = prefs()
         val eKey = (p.getString("eleven_key", "") ?: "").trim()
         val eVoice = (p.getString("eleven_voice", "") ?: "").trim()
-        if (voiceOn() && eKey.isNotEmpty() && eVoice.isNotEmpty() && p.getString("voice_mode", "cloud") == "cloud") {
+        val mode = p.getString("voice_mode", "cloud")
+        val fKey = (p.getString("fish_key", "") ?: "").trim()
+        val fVoice = (p.getString("fish_voice", "") ?: "").trim()
+        if (voiceOn() && mode == "fish" && fKey.isNotEmpty() && fVoice.isNotEmpty()) {
+            val clean2 = cleanForSpeech(text)
+            if (clean2.isEmpty()) { afterReply(); return }
+            val spd2 = speedValue()
+            thread {
+                try {
+                    val wav = Effects.process(FishVoice.speak(fKey, fVoice, spd2, clean2), robotLevel(), glitchLevel())
+                    ui.post { playWav(wav) }
+                } catch (e: Exception) {
+                    ui.post {
+                        say(lastReply + "\n(suara Fish gagal: ${e.message?.take(80)})")
+                        speakFallback(text)
+                    }
+                }
+            }
+        } else if (voiceOn() && eKey.isNotEmpty() && eVoice.isNotEmpty() && mode == "cloud") {
             val eModel = (p.getString("eleven_model", "") ?: "").trim()
             val stab = p.getString("eleven_stab", "")?.toFloatOrNull() ?: ElevenVoice.DEFAULT_STABILITY
             val sim = p.getString("eleven_sim", "")?.toFloatOrNull() ?: ElevenVoice.DEFAULT_SIMILARITY
@@ -325,7 +657,7 @@ class CapriService : Service() {
             if (clean.isEmpty()) { afterReply(); return }
             thread {
                 try {
-                    val wav = ElevenVoice.speak(eKey, eVoice, eModel, stab, sim, spd.coerceIn(0.7f, 1.2f), clean)
+                    val wav = Effects.process(ElevenVoice.speak(eKey, eVoice, eModel, stab, sim, spd.coerceIn(0.7f, 1.2f), clean), robotLevel(), glitchLevel())
                     ui.post { playWav(wav) }
                 } catch (e: Exception) {
                     ui.post {
@@ -428,6 +760,17 @@ class CapriService : Service() {
         override fun onResults(results: Bundle?) {
             listening = false
             val t = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()?.trim() ?: ""
+            if (panel == null && wakeOn()) {
+                if (t.contains("capri", ignoreCase = true)) {
+                    val rest = t.replace(Regex("(?i)capri[,.!?]?"), "").trim()
+                    togglePanel()
+                    if (rest.isNotEmpty()) ask(rest) else say("Ya? Apa, choom?")
+                } else {
+                    wakeLoop(500)
+                }
+                refresh()
+                return
+            }
             if (t.isNotEmpty()) {
                 input?.setText("")
                 ask(t)
@@ -439,6 +782,10 @@ class CapriService : Service() {
 
         override fun onError(error: Int) {
             listening = false
+            if (panel == null && wakeOn() && error != SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS && error != SpeechRecognizer.ERROR_NETWORK) {
+                wakeLoop(800)
+                return
+            }
             when (error) {
                 SpeechRecognizer.ERROR_NO_MATCH,
                 SpeechRecognizer.ERROR_SPEECH_TIMEOUT,
@@ -507,6 +854,7 @@ class CapriService : Service() {
             wm.removeView(pet)
             pet = null
         }
+        ui.removeCallbacksAndMessages(null)
         stopAudio()
         tts?.stop()
         tts?.shutdown()

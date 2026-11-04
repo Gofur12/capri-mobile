@@ -7,6 +7,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
 
     <queries>
         <intent><action android:name="android.speech.RecognitionService" /></intent>
@@ -25,7 +26,7 @@
         <service
             android:name=".CapriService"
             android:exported="false"
-            android:foregroundServiceType="specialUse|microphone">
+            android:foregroundServiceType="specialUse|microphone|mediaProjection">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Floating companion overlay" />

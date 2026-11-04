@@ -65,14 +65,25 @@ object Brain {
     }
 
     @Synchronized
-    private fun messages(user: String, system: String): JSONArray {
-        history.add("user" to user)
-        trim()
+    private fun messages(user: String, system: String, note: Boolean, image: String?): JSONArray {
+        if (!note) { history.add("user" to (if (image != null) "[lihat layar] $user" else user)); trim() }
         val arr = JSONArray()
         arr.put(JSONObject().put("role", "system").put("content", system))
         for ((role, text) in history) arr.put(JSONObject().put("role", role).put("content", text))
+        // note = Capri ngomong duluan: instruksinya ikut dikirim, tapi tidak disimpan ke riwayat.
+        if (note) arr.put(JSONObject().put("role", "user").put("content", user))
+        if (image != null) {
+            arr.remove(arr.length() - 1)
+            val content = JSONArray()
+                .put(JSONObject().put("type", "text").put("text", user))
+                .put(JSONObject().put("type", "image_url").put("image_url", JSONObject().put("url", "data:image/jpeg;base64,$image")))
+            arr.put(JSONObject().put("role", "user").put("content", content))
+        }
         return arr
     }
+
+    fun isError(s: String): Boolean =
+        listOf("API key", "Model itu", "Koneksi gagal", "Server NVIDIA", "Kebanyakan", "[SINYAL").any { s.startsWith(it) }
 
     @Synchronized
     private fun remember(reply: String) {
@@ -87,7 +98,7 @@ object Brain {
     }
 
     // lang: "id" | "en" | "auto". replies: "short" | "normal" | "long". memory: jumlah pesan yang diingat.
-    fun ask(key: String, model: String, text: String, nick: String, lang: String, replies: String, memory: Int): String {
+    fun ask(key: String, model: String, text: String, nick: String, lang: String, replies: String, memory: Int, note: Boolean = false, image: String? = null, context: String = ""): String {
         cap = memory.coerceIn(2, 80)
         val parts = StringBuilder(PERSONA)
         parts.append(
@@ -104,8 +115,9 @@ object Brain {
                 else -> " Keep replies to two or three sentences."
             }
         )
+        if (context.isNotBlank()) parts.append(" Recent things you have seen on the user's screen, oldest first: $context. Mention them only when relevant.")
         if (nick.isNotBlank()) parts.append(" The user wants to be called $nick. Use the name now and then, not in every reply.")
-        val msgs = messages(text, parts.toString())
+        val msgs = messages(text, parts.toString(), note, image)
         val maxTokens = when (replies) { "long" -> 4096; else -> 2000 }
         return try {
             var out = ""
@@ -127,8 +139,12 @@ object Brain {
                 c.setRequestProperty("Accept", "application/json")
                 c.outputStream.use { it.write(body.toString().toByteArray()) }
                 val code = c.responseCode
+                if (code == 400 && image != null) {
+                    if (!note) dropLast()
+                    return ask(key, model, text, nick, lang, replies, memory, note, null, context) // model tidak bisa gambar: coba tanpa gambar
+                }
                 if (code != 200) {
-                    dropLast()
+                    if (!note) dropLast()
                     return when (code) {
                         401, 403 -> "API key ditolak. Cek lagi keynya (diawali nvapi-)."
                         404 -> "Model itu nggak ada di key kamu. Ganti model di app Capri."
@@ -143,11 +159,11 @@ object Brain {
                 out = out.replace(Regex("(?s)<think>.*?</think>"), "").trim()
                 if (out.isNotEmpty() || choice.optString("finish_reason") != "length") break
             }
-            if (out.isEmpty()) { dropLast(); return "[SINYAL RUSAK] Hilang di static. Coba lagi, atau ganti model di app Capri." }
-            remember(out)
+            if (out.isEmpty()) { if (!note) dropLast(); return "[SINYAL RUSAK] Hilang di static. Coba lagi, atau ganti model di app Capri." }
+            if (!note) remember(out)
             out
         } catch (e: Exception) {
-            dropLast()
+            if (!note) dropLast()
             "Koneksi gagal (${e.javaClass.simpleName}). Cek internet."
         }
     }
