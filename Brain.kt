@@ -1,11 +1,13 @@
 package app.capri.mobile
 
+import android.content.Context
+import android.content.SharedPreferences
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 
-// Otak Capri: memanggil API NVIDIA (format OpenAI chat completions).
+// Otak Capri: memanggil API NVIDIA (format OpenAI chat completions). Riwayat chat disimpan di HP.
 object Brain {
     const val DEFAULT_MODEL = "nvidia/nemotron-3.5-super-vl-120b-a12b"
     private const val ENDPOINT = "https://integrate.api.nvidia.com/v1/chat/completions"
@@ -16,20 +18,58 @@ object Brain {
         "Act like a playful chaos gremlin: high-energy, teasing, a little smug, curious about the user, openly fond of them but never mean. " +
         "You can't stand corpos, Arasaka most of all. " +
         "Never sound like customer support: no 'How can I help?', no disclaimers, no lists. Talk like a friend texting. " +
-        "Most replies are one short line, two or three sentences at most. " +
         "Use Night City slang sparingly: at most one word like 'choom' per reply, and most replies have none. " +
         "When they are tired or hurting, drop the jokes and be warm and plain. " +
-        "You only know what they type to you, so never pretend to see their screen. " +
-        "Always reply in the language the user writes in."
+        "You only know what they type or say to you, so never pretend to see their screen. " +
+        "Your replies are spoken out loud, so write plain speakable text: no emoji, no markdown, no asterisks."
 
     private val history = ArrayList<Pair<String, String>>()
+    private var store: SharedPreferences? = null
+    @Volatile private var cap = 20
+
+    fun load(ctx: Context) {
+        val p = ctx.getSharedPreferences("capri", Context.MODE_PRIVATE)
+        store = p
+        synchronized(this) {
+            if (history.isEmpty()) {
+                try {
+                    val arr = JSONArray(p.getString("mem", "[]"))
+                    for (i in 0 until arr.length()) {
+                        val o = arr.getJSONObject(i)
+                        history.add(o.getString("r") to o.getString("c"))
+                    }
+                } catch (e: Exception) {
+                    // ingatan rusak: mulai dari kosong
+                }
+            }
+        }
+    }
+
+    fun clear(ctx: Context) {
+        val p = ctx.getSharedPreferences("capri", Context.MODE_PRIVATE)
+        store = p
+        synchronized(this) { history.clear() }
+        p.edit().remove("mem").apply()
+    }
 
     @Synchronized
-    private fun messages(user: String): JSONArray {
-        history.add("user" to user)
-        while (history.size > 12) history.removeAt(0)
+    private fun save() {
         val arr = JSONArray()
-        arr.put(JSONObject().put("role", "system").put("content", PERSONA))
+        for ((role, text) in history) arr.put(JSONObject().put("r", role).put("c", text))
+        store?.edit()?.putString("mem", arr.toString())?.apply()
+    }
+
+    @Synchronized
+    private fun trim() {
+        while (history.size > cap) history.removeAt(0)
+    }
+
+    @Synchronized
+    private fun messages(user: String, system: String): JSONArray {
+        history.add("user" to user)
+        trim()
+        val arr = JSONArray()
+        arr.put(JSONObject().put("role", "system").put("content", system))
         for ((role, text) in history) arr.put(JSONObject().put("role", role).put("content", text))
         return arr
     }
@@ -37,7 +77,8 @@ object Brain {
     @Synchronized
     private fun remember(reply: String) {
         history.add("assistant" to reply)
-        while (history.size > 12) history.removeAt(0)
+        trim()
+        save()
     }
 
     @Synchronized
@@ -45,12 +86,31 @@ object Brain {
         if (history.isNotEmpty()) history.removeAt(history.size - 1)
     }
 
-    fun ask(key: String, model: String, text: String): String {
-        val msgs = messages(text)
+    // lang: "id" | "en" | "auto". replies: "short" | "normal" | "long". memory: jumlah pesan yang diingat.
+    fun ask(key: String, model: String, text: String, nick: String, lang: String, replies: String, memory: Int): String {
+        cap = memory.coerceIn(2, 80)
+        val parts = StringBuilder(PERSONA)
+        parts.append(
+            when (lang) {
+                "id" -> " Always reply in casual Bahasa Indonesia, even if the user writes in English."
+                "en" -> " Always reply in English, even if the user writes in Indonesian."
+                else -> " Always reply in the language the user writes in."
+            }
+        )
+        parts.append(
+            when (replies) {
+                "short" -> " Keep every reply to one or two short sentences."
+                "long" -> " Replies can run a short paragraph, up to about five sentences."
+                else -> " Keep replies to two or three sentences."
+            }
+        )
+        if (nick.isNotBlank()) parts.append(" The user wants to be called $nick. Use the name now and then, not in every reply.")
+        val msgs = messages(text, parts.toString())
+        val maxTokens = when (replies) { "long" -> 4096; else -> 2000 }
         return try {
             var out = ""
             // Model reasoning (mis. Nemotron Super) memakai jatah token untuk "berpikir". Kalau kepotong sebelum menjawab, ulangi dengan jatah lebih besar.
-            for (limit in intArrayOf(2000, 4096)) {
+            for (limit in intArrayOf(maxTokens, 4096)) {
                 val body = JSONObject()
                     .put("model", model)
                     .put("messages", msgs)
