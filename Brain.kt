@@ -46,37 +46,44 @@ object Brain {
     }
 
     fun ask(key: String, model: String, text: String): String {
-        val body = JSONObject()
-            .put("model", model)
-            .put("messages", messages(text))
-            .put("max_tokens", 300)
-            .put("temperature", 0.9)
-            .put("stream", false)
+        val msgs = messages(text)
         return try {
-            val c = URL(ENDPOINT).openConnection() as HttpURLConnection
-            c.requestMethod = "POST"
-            c.connectTimeout = 15000
-            c.readTimeout = 60000
-            c.doOutput = true
-            c.setRequestProperty("Authorization", "Bearer $key")
-            c.setRequestProperty("Content-Type", "application/json")
-            c.setRequestProperty("Accept", "application/json")
-            c.outputStream.use { it.write(body.toString().toByteArray()) }
-            val code = c.responseCode
-            if (code != 200) {
-                dropLast()
-                return when (code) {
-                    401, 403 -> "API key ditolak. Cek lagi keynya (diawali nvapi-)."
-                    404 -> "Model itu nggak ada di key kamu. Ganti model di app Capri."
-                    429 -> "Kebanyakan request. Tunggu semenit."
-                    else -> "Server NVIDIA error ($code). Coba lagi atau ganti model."
+            var out = ""
+            // Model reasoning (mis. Nemotron Super) memakai jatah token untuk "berpikir". Kalau kepotong sebelum menjawab, ulangi dengan jatah lebih besar.
+            for (limit in intArrayOf(2000, 4096)) {
+                val body = JSONObject()
+                    .put("model", model)
+                    .put("messages", msgs)
+                    .put("max_tokens", limit)
+                    .put("temperature", 0.9)
+                    .put("stream", false)
+                val c = URL(ENDPOINT).openConnection() as HttpURLConnection
+                c.requestMethod = "POST"
+                c.connectTimeout = 15000
+                c.readTimeout = 120000
+                c.doOutput = true
+                c.setRequestProperty("Authorization", "Bearer $key")
+                c.setRequestProperty("Content-Type", "application/json")
+                c.setRequestProperty("Accept", "application/json")
+                c.outputStream.use { it.write(body.toString().toByteArray()) }
+                val code = c.responseCode
+                if (code != 200) {
+                    dropLast()
+                    return when (code) {
+                        401, 403 -> "API key ditolak. Cek lagi keynya (diawali nvapi-)."
+                        404 -> "Model itu nggak ada di key kamu. Ganti model di app Capri."
+                        429 -> "Kebanyakan request. Tunggu semenit."
+                        else -> "Server NVIDIA error ($code). Coba lagi atau ganti model."
+                    }
                 }
+                val json = JSONObject(c.inputStream.bufferedReader().use { it.readText() })
+                val choice = json.getJSONArray("choices").getJSONObject(0)
+                val msg = choice.getJSONObject("message")
+                out = if (msg.isNull("content")) "" else msg.getString("content")
+                out = out.replace(Regex("(?s)<think>.*?</think>"), "").trim()
+                if (out.isNotEmpty() || choice.optString("finish_reason") != "length") break
             }
-            val json = JSONObject(c.inputStream.bufferedReader().use { it.readText() })
-            val msg = json.getJSONArray("choices").getJSONObject(0).getJSONObject("message")
-            var out = if (msg.isNull("content")) "" else msg.getString("content")
-            out = out.replace(Regex("(?s)<think>.*?</think>"), "").trim()
-            if (out.isEmpty()) { dropLast(); return "[SINYAL RUSAK] Hilang di static. Coba lagi?" }
+            if (out.isEmpty()) { dropLast(); return "[SINYAL RUSAK] Hilang di static. Coba lagi, atau ganti model di app Capri." }
             remember(out)
             out
         } catch (e: Exception) {

@@ -32,8 +32,8 @@ class MainActivity : Activity() {
         val key = EditText(this).apply {
             hint = "nvapi-..."
             setText(prefs.getString("key", ""))
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
             setSingleLine()
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         }
         val model = EditText(this).apply {
             setText(prefs.getString("model", Brain.DEFAULT_MODEL))
